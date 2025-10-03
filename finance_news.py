@@ -16,31 +16,45 @@ now_utc   = datetime.now(timezone.utc)
 since_utc = now_utc - timedelta(hours=HOURS)
 date_str  = now_utc.strftime("%Y-%m-%d")
 
-# ---------- Discord limits (safe) ----------
+# ---------- Discord limits (extra safe) ----------
 DISCORD_MAX_EMBEDS   = 10     # embeds per message
 DISCORD_MAX_EMBED    = 6000   # hard API limit
-EMBED_TARGET_BUDGET  = 5500   # target to keep margin
+# Budgets cibles très serrés pour éviter les surprises
+EMBED_TARGET_BUDGET  = 3500
 DISCORD_MAX_TITLE    = 256
 DISCORD_MAX_DESC     = 4096
 FIELD_HARD_MAX       = 1024
-FIELD_SOFT_MAX       = 700
-DESC_SOFT_MAX        = 300
+FIELD_SOFT_MAX       = 450    # notre cible (<< 1024)
+DESC_SOFT_MAX        = 180    # description courte
 
 # ---------- Helpers ----------
 def _text_len(s: str) -> int:
     return len(s or "")
 
+def _normalize_text(s: str) -> str:
+    """Nettoie le texte pour réduire la taille inutile (espaces, entêtes)."""
+    if not s:
+        return ""
+    s = s.replace("\r", "")
+    # supprime titres markdown superflus dans les chunks
+    s = re.sub(r"^\s*#+\s*", "", s, flags=re.MULTILINE)
+    # compresse espaces
+    s = re.sub(r"[ \t]{2,}", " ", s)
+    # limite lignes très longues
+    return s.strip()
+
 def chunk_text(txt: str, size: int = FIELD_SOFT_MAX):
-    """Split by lines; hard-split very long lines (e.g., URLs)."""
-    txt = (txt or "").strip()
+    """Découpe par lignes, puis par caractères si nécessaire, en respectant size."""
+    txt = _normalize_text(txt)
     if not txt:
         return []
     lines, chunks, buf = txt.splitlines(), [], ""
     for line in lines:
+        line = line.strip()
         add_len = len(line) + (0 if not buf else 1)
         if len(buf) + add_len > size:
-            if buf.strip():
-                chunks.append(buf.rstrip())
+            if buf:
+                chunks.append(buf)
             if len(line) > size:
                 for i in range(0, len(line), size):
                     chunks.append(line[i:i+size])
@@ -49,9 +63,9 @@ def chunk_text(txt: str, size: int = FIELD_SOFT_MAX):
                 buf = line
         else:
             buf = (buf + "\n" + line) if buf else line
-    if buf.strip():
-        chunks.append(buf.rstrip())
-    return chunks
+    if buf:
+        chunks.append(buf)
+    return [c.strip()[:size] for c in chunks if c.strip()]
 
 def _clean_embed(e: dict) -> dict:
     """Remove None/empty & clamp base sizes."""
@@ -59,8 +73,10 @@ def _clean_embed(e: dict) -> dict:
     for k, v in e.items():
         if v is None:
             continue
-        if isinstance(v, str) and not v.strip():
-            continue
+        if isinstance(v, str):
+            v = v.strip()
+            if not v:
+                continue
         if k == "title":
             out[k] = v[:DISCORD_MAX_TITLE]
         elif k == "description":
@@ -68,8 +84,8 @@ def _clean_embed(e: dict) -> dict:
         elif k == "fields":
             vv = []
             for f in (v or []):
-                name = (f.get("name") or "").strip()
-                value = (f.get("value") or "").strip()
+                name = _normalize_text(f.get("name") or "")
+                value = _normalize_text(f.get("value") or "")
                 if name and value:
                     if len(value) > FIELD_SOFT_MAX:
                         value = value[:FIELD_SOFT_MAX] + "…"
@@ -82,6 +98,7 @@ def _clean_embed(e: dict) -> dict:
     return out
 
 def _embed_size(e: dict) -> int:
+    """Estimation — Discord compte la somme des longueurs de toutes les strings."""
     size = 0
     size += _text_len(e.get("title"))
     size += _text_len(e.get("description"))
@@ -91,15 +108,24 @@ def _embed_size(e: dict) -> int:
     size += _text_len(footer.get("text"))
     return size
 
-def _shrink_to_fit(e: dict):
-    """Reduce desc/field to fit under target, then under hard 6000 if needed."""
+def _shrink_to_fit(e: dict, target=EMBED_TARGET_BUDGET):
+    """
+    Réduit desc/field pour passer sous 'target', puis sous 6000 en ultime recours.
+    Utilise des coupes agressives par paliers.
+    """
     e = _clean_embed(e)
+    # 1) Desc courte dès le départ
+    if e.get("description") and len(e["description"]) > DESC_SOFT_MAX:
+        e["description"] = e["description"][:DESC_SOFT_MAX] + "…"
+        e = _clean_embed(e)
+
+    # 2) Boucle budget cible
     guard = 0
-    while _embed_size(e) > EMBED_TARGET_BUDGET and guard < 100:
+    while _embed_size(e) > target and guard < 100:
         guard += 1
         desc = e.get("description")
-        if desc and len(desc) > 120:
-            e["description"] = desc[:-80] + "…"
+        if desc and len(desc) > 90:
+            e["description"] = desc[:-60] + "…"
             e = _clean_embed(e)
             continue
         if e.get("fields"):
@@ -111,12 +137,13 @@ def _shrink_to_fit(e: dict):
                 continue
         break
 
+    # 3) Ultime filet: assure < 6000
     guard = 0
     while _embed_size(e) > DISCORD_MAX_EMBED and guard < 100:
         guard += 1
         desc = e.get("description")
-        if desc and len(desc) > 50:
-            e["description"] = desc[:-50] + "…"
+        if desc and len(desc) > 30:
+            e["description"] = desc[:-30] + "…"
             e = _clean_embed(e)
             continue
         if e.get("fields"):
@@ -137,25 +164,67 @@ def _shrink_to_fit(e: dict):
         break
     return e
 
+def _retry_shrink_and_send(payload, max_retries=3):
+    """
+    En cas de 400 'Embed size exceeds ...', on réduit encore et on réessaie.
+    Réduit description à 120/80/50 puis fields à 350/250/200.
+    """
+    for attempt in range(max_retries + 1):
+        r = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=30)
+        if r.ok:
+            return
+        if "Embed size exceeds maximum size of 6000" not in r.text:
+            # autre erreur → remonter
+            raise RuntimeError(f"Discord payload error: {r.status_code} {r.text}")
+
+        # Retente avec shrink plus agressif
+        next_embeds = []
+        for em in payload.get("embeds", []):
+            # réduit description
+            if em.get("description"):
+                limits = [120, 80, 50]
+                lim = limits[min(attempt, len(limits)-1)]
+                em["description"] = _normalize_text(em["description"])[:lim] + "…"
+            # réduit field unique
+            if em.get("fields"):
+                val = em["fields"][0]["value"]
+                limits = [350, 250, 200]
+                lim = limits[min(attempt, len(limits)-1)]
+                em["fields"][0]["value"] = _normalize_text(val)[:lim] + "…"
+            # re-clean
+            em = _shrink_to_fit(em, target=3000)
+            next_embeds.append(_clean_embed(em))
+        payload = {"embeds": next_embeds}
+    # si on sort de la boucle, toujours trop gros
+    raise RuntimeError("Discord 400 after retries: embeds still exceed size after aggressive shrinking.")
+
 def _send_embeds_in_batches(embeds: list):
-    """Send in batches of up to 10 embeds (multiple messages if needed)."""
+    """Envoie par lots de 10 embeds max; shrink + retry si nécessaire."""
     for i in range(0, len(embeds), DISCORD_MAX_EMBEDS):
         batch = embeds[i:i+DISCORD_MAX_EMBEDS]
-        safe_batch = [_shrink_to_fit(em) for em in batch]
-        payload = {"embeds": [_clean_embed(em) for em in safe_batch if em.get("title") or em.get("description") or em.get("fields")]}
-        r = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=30)
-        if not r.ok:
-            raise RuntimeError(f"Discord 400 payload error: {r.status_code} {r.text}")
+        # shrink initial très agressif + pas de footer sauf sur le 1er embed du lot
+        safe_batch = []
+        for j, em in enumerate(batch):
+            if j > 0 and "footer" in em:
+                em.pop("footer", None)
+            em = _shrink_to_fit(em, target=EMBED_TARGET_BUDGET)
+            # seconde passe de sécurité
+            if _embed_size(em) > EMBED_TARGET_BUDGET:
+                em = _shrink_to_fit(em, target=3000)
+            safe_batch.append(_clean_embed(em))
+
+        payload = {"embeds": [em for em in safe_batch if em.get("title") or em.get("description") or em.get("fields")]}
+        _retry_shrink_and_send(payload, max_retries=3)
 
 def post_discord_embeds(title: str, description: str, bullet_text: str, links_text: str):
     """
-    Robust strategy:
+    Stratégie robuste:
       - Embed #1: title + short description + footer (no fields)
-      - Then: 1 field per embed for bullets (chunks), then sources (chunks)
-      - Send multiple messages if >10 embeds
+      - Ensuite: 1 field par embed pour Synthèse (chunks), puis Sources (chunks)
+      - Multi-messages si >10 embeds
     """
     title = (title or "").strip()[:DISCORD_MAX_TITLE]
-    description = (description or "").strip()
+    description = _normalize_text(description)
     if len(description) > DESC_SOFT_MAX:
         description = description[:DESC_SOFT_MAX] + "…"
 
@@ -165,7 +234,7 @@ def post_discord_embeds(title: str, description: str, bullet_text: str, links_te
         "color": COLOR,
         "footer": {"text": f"Veille Finance • {date_str} • Window: {HOURS}h • {TZ}"},
     }
-    first_embed = _shrink_to_fit(first_embed)
+    first_embed = _shrink_to_fit(first_embed, target=EMBED_TARGET_BUDGET)
 
     embeds = [first_embed]
 
@@ -174,18 +243,18 @@ def post_discord_embeds(title: str, description: str, bullet_text: str, links_te
 
     for idx, ch in enumerate(bullet_chunks):
         e = {"color": COLOR, "fields": [{"name": "Synthèse" if idx == 0 else "Synthèse (suite)", "value": ch}]}
-        embeds.append(_shrink_to_fit(e))
+        embeds.append(_shrink_to_fit(e, target=EMBED_TARGET_BUDGET))
 
     for idx, ch in enumerate(link_chunks):
         e = {"color": COLOR, "fields": [{"name": "Sources" if idx == 0 else "Sources (suite)", "value": ch}]}
-        embeds.append(_shrink_to_fit(e))
+        embeds.append(_shrink_to_fit(e, target=EMBED_TARGET_BUDGET))
 
     _send_embeds_in_batches(embeds)
 
 # ---------- OpenAI (Responses API + web_search tool) ----------
 def call_openai_websearch(prompt: str) -> str:
     """
-    Call OpenAI Responses API with 'web_search' tool enabled.
+    Calls OpenAI Responses API with 'web_search' tool enabled.
     Returns Markdown.
     """
     url = "https://api.openai.com/v1/responses"
